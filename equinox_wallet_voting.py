@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import base64
 import asyncio
 import nest_asyncio
@@ -24,6 +24,8 @@ CONTRACT_ADDRESS = "neutron13l5nw6fh4xascjfyru5pe9w5ur8rp7svzl7hhkdh7jfdk3fup75q
 WS_ENDPOINT = "wss://neutron-rpc.publicnode.com:443/websocket"
 BLOCK_TIME_SECONDS = 6
 DEFAULT_REST_ENDPOINT = "https://rest.neutron.nodestake.top"
+COLLECTION_NAME_ESSENCE = 'wallet_essence_snapshots'
+ESSENCE_SNAPSHOT_VALIDITY_HOURS = 24  # How long to consider a snapshot valid
 
 # MongoDB setup
 MONGO_URI = st.secrets["mongo"]["connection_string"]
@@ -83,10 +85,12 @@ def setup_mongodb():
             validator={"$jsonSchema": wallet_votes_schema}
         )
     
-    return db[COLLECTION_NAME]
+    return db
 
-# Initialize MongoDB collection
-wallet_votes_collection = setup_mongodb()
+# Initialize MongoDB database and collections
+db = setup_mongodb()
+wallet_votes_collection = db[COLLECTION_NAME]
+wallet_essence_collection = db[COLLECTION_NAME_ESSENCE]
 
 async def get_rpc_endpoints():
     """Fetch RPC endpoints from Cosmos Chain Registry"""
@@ -455,6 +459,100 @@ def fetch_pool_data():
         st.error(f"Error fetching pool data: {str(e)}")
         return {}
 
+def get_wallet_essence(wallet_address: str) -> dict:
+    """Fetch wallet essence data from contract"""
+    # Get list of REST endpoints (similar to fetch_epochs)
+    try:
+        response = requests.get("https://raw.githubusercontent.com/cosmos/chain-registry/master/neutron/chain.json")
+        data = response.json()
+        
+        rest_endpoints = []
+        for api in data.get("apis", {}).get("rest", []):
+            address = api.get("address", "")
+            if address.startswith("http"):
+                rest_endpoints.append(address.rstrip('/'))
+        
+        # Add additional endpoints
+        additional_endpoints = [
+            "https://rest.neutron.nodestake.top",
+            "https://neutron-rest.publicnode.com",
+            "https://api-neutron.cosmos.nodestake.top",
+            "https://neutron-api.lavenderfive.com",
+            "https://api.neutron.nodestake.top"
+        ]
+        
+        for endpoint in additional_endpoints:
+            if endpoint not in rest_endpoints:
+                rest_endpoints.append(endpoint)
+        
+        # Try each endpoint until one works
+        query = {
+            "user": {
+                "address": wallet_address
+            }
+        }
+        query_b64 = base64.b64encode(json.dumps(query).encode()).decode()
+        
+        for endpoint in rest_endpoints:
+            try:
+                url = f"{endpoint}/cosmwasm/wasm/v1/contract/{CONTRACT_ADDRESS}/smart/{query_b64}"
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'data' in data and len(data['data']) > 0:
+                        return {
+                            "wallet_address": wallet_address,
+                            "essence_value": data['data'][0].get('essence_value', '0'),
+                            "snapshot_time": datetime.utcnow()
+                        }
+            except Exception as e:
+                continue  # Try next endpoint
+        
+        raise Exception("No working REST endpoints found")
+        
+    except Exception as e:
+        st.error(f"Error fetching essence for {wallet_address}: {str(e)}")
+        return None
+
+def get_wallet_essences(wallets: List[str], progress_bar) -> Dict[str, str]:
+    """Get essence values for all wallets"""
+    # Check if we have a recent snapshot
+    latest_snapshot = wallet_essence_collection.find_one(
+        sort=[("snapshot_time", pymongo.DESCENDING)]
+    )
+    
+    if latest_snapshot and datetime.utcnow() - latest_snapshot['snapshot_time'] < timedelta(hours=ESSENCE_SNAPSHOT_VALIDITY_HOURS):
+        # Use existing snapshot
+        snapshots = list(wallet_essence_collection.find())
+        return {
+            snap['wallet_address']: snap['essence_value'] 
+            for snap in snapshots
+        }, latest_snapshot['snapshot_time']
+    
+    # Need new snapshot
+    progress_bar.progress(0, "Fetching wallet voting power...")
+    essence_data = []
+    
+    for i, wallet in enumerate(wallets):
+        essence = get_wallet_essence(wallet)
+        if essence:
+            essence_data.append(essence)
+        progress = (i + 1) / len(wallets)
+        progress_bar.progress(progress, f"Fetching voting power {i+1}/{len(wallets)}")
+        time.sleep(0.1)  # Rate limiting
+    
+    # Store new snapshot
+    if essence_data:
+        wallet_essence_collection.delete_many({})  # Clear old snapshots
+        wallet_essence_collection.insert_many(essence_data)
+        snapshot_time = essence_data[0]['snapshot_time']
+        return {
+            data['wallet_address']: data['essence_value']
+            for data in essence_data
+        }, snapshot_time
+    
+    return {}, None
+
 def create_dashboard():
     st.title("Equinox Wallet Voting Dashboard")
     
@@ -534,68 +632,84 @@ def create_dashboard():
             wallet_votes = list(wallet_votes_collection.aggregate(pipeline))
         
         if wallet_votes:
+            # Get wallet essences
+            wallet_addresses = [vote['latest_vote']['sender'] for vote in wallet_votes]
+            with st.spinner('Fetching wallet voting power...'):
+                essence_values, snapshot_time = get_wallet_essences(wallet_addresses, st.progress(0))
+            
+            if snapshot_time:
+                st.info(f"Voting weight as per {snapshot_time.strftime('%Y-%m-%d')}")
+            
             st.subheader(f"Wallet Voting Distribution (Total Wallets: {len(wallet_votes)})")
             
-            # Show loading spinner while formatting data
-            with st.spinner('Formatting vote distribution...'):
-                # Group votes by wallet first
-                wallet_groups = {}
-                for wallet_vote in wallet_votes:
-                    sender = wallet_vote['latest_vote']['sender']
-                    votes = wallet_vote['latest_vote']['votes']
-                    
-                    # Sort votes by weight descending
-                    sorted_votes = sorted(votes, key=lambda x: float(x['weight']), reverse=True)
-                    
-                    wallet_groups[sender] = [
-                        {
-                            "Pool": pool_names.get(vote['lp_token'], vote['lp_token']),
-                            "Vote Weight (%)": f"{float(vote['weight']) * 100:.2f}%",
-                            "Visual Distribution": float(vote['weight']) * 100
-                        }
-                        for vote in sorted_votes
-                    ]
+            # Group and sort by essence value
+            wallet_groups = {}
+            for wallet_vote in wallet_votes:
+                sender = wallet_vote['latest_vote']['sender']
+                votes = wallet_vote['latest_vote']['votes']
+                # Convert essence value to millions and round to integer
+                essence = int(int(essence_values.get(sender, '0')) / 1_000_000)
                 
-                # Display each wallet group
-                for wallet, votes in wallet_groups.items():
-                    st.markdown(f"#### Wallet: `{wallet}`")
-                    
-                    # Create DataFrame for this wallet's votes
-                    df = pd.DataFrame(votes)
-                    
-                    # Format the progress bars
-                    df['Visual Distribution'] = df['Visual Distribution'].apply(
-                        lambda pct: f"""
-                            <div style="width:100%; height:20px; background-color:#f0f2f6; border-radius:10px; overflow:hidden">
-                                <div style="width:{pct}%; height:100%; background-color:#00cc00; border-radius:10px"></div>
-                            </div>
-                        """
-                    )
-                    
-                    # Add CSS for table formatting
-                    st.markdown("""
-                        <style>
-                            table {
-                                width: 100% !important;
-                                table-layout: fixed !important;
-                            }
-                            th, td {
-                                text-align: left !important;
-                                width: 33.33% !important;
-                                word-wrap: break-word !important;
-                            }
-                        </style>
-                    """, unsafe_allow_html=True)
-                    
-                    # Display the table
-                    st.write(
-                        df.to_html(
-                            escape=False,
-                            index=False,
-                            formatters={'Visual Distribution': lambda x: x}
-                        ),
-                        unsafe_allow_html=True
-                    )
+                wallet_groups[sender] = {
+                    'essence': essence,
+                    'votes': sorted(votes, key=lambda x: float(x['weight']), reverse=True)
+                }
+            
+            # Sort wallets by essence value
+            sorted_wallets = sorted(
+                wallet_groups.items(),
+                key=lambda x: x[1]['essence'],
+                reverse=True
+            )
+            
+            # Display each wallet group
+            for wallet, data in sorted_wallets:
+                st.markdown(f"#### Wallet: `{wallet}`")
+                st.markdown(f"*Cosmic Essence: {data['essence']:,}*")  # Already in millions and formatted with commas
+                
+                # Create DataFrame for this wallet's votes
+                df = pd.DataFrame([
+                    {
+                        "Pool": pool_names.get(vote['lp_token'], vote['lp_token']),
+                        "Vote Weight (%)": f"{float(vote['weight']) * 100:.2f}%",
+                        "Visual Distribution": float(vote['weight']) * 100
+                    }
+                    for vote in data['votes']
+                ])
+                
+                # Format the progress bars
+                df['Visual Distribution'] = df['Visual Distribution'].apply(
+                    lambda pct: f"""
+                        <div style="width:100%; height:20px; background-color:#f0f2f6; border-radius:10px; overflow:hidden">
+                            <div style="width:{pct}%; height:100%; background-color:#00cc00; border-radius:10px"></div>
+                        </div>
+                    """
+                )
+                
+                # Add CSS for table formatting
+                st.markdown("""
+                    <style>
+                        table {
+                            width: 100% !important;
+                            table-layout: fixed !important;
+                        }
+                        th, td {
+                            text-align: left !important;
+                            width: 33.33% !important;
+                            word-wrap: break-word !important;
+                        }
+                    </style>
+                """, unsafe_allow_html=True)
+                
+                # Display the table
+                st.write(
+                    df.to_html(
+                        escape=False,
+                        index=False,
+                        formatters={'Visual Distribution': lambda x: x}
+                    ),
+                    unsafe_allow_html=True
+                )
         else:
             st.info("No voting data available for this epoch")
 
