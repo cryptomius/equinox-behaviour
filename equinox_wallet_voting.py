@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import base64
 import asyncio
 import nest_asyncio
@@ -190,10 +190,12 @@ async def fetch_transactions(progress_bar, start_height=None):
     if not endpoint:
         raise Exception("No working RPC endpoints found")
 
-    transactions = []
     page = 1
     per_page = 25
     should_continue = True
+    batch_size = 10  # Process transactions in batches of 10
+    current_batch = []
+    total_processed = 0
     
     try:
         async with websockets.connect(endpoint, ping_interval=None) as websocket:
@@ -271,8 +273,33 @@ async def fetch_transactions(progress_bar, start_height=None):
                             tx_data = {
                                 "transaction_hash": tx["hash"],
                                 "block_height": int(tx["height"]),
-                                "block_timestamp": tx.get("timestamp") or tx.get("header", {}).get("timestamp"),
                             }
+                            
+                            # Get block info to get timestamp
+                            block_query = {
+                                "jsonrpc": "2.0",
+                                "id": f"block_{tx['height']}",
+                                "method": "block",
+                                "params": {
+                                    "height": tx["height"]
+                                }
+                            }
+                            
+                            await websocket.send(json.dumps(block_query))
+                            block_response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+                            block_data = json.loads(block_response)
+                            
+                            if "result" in block_data and "block" in block_data["result"]:
+                                raw_timestamp = block_data["result"]["block"]["header"]["time"]
+                                try:
+                                    # Parse ISO format timestamp
+                                    tx_data["block_timestamp"] = datetime.fromisoformat(raw_timestamp.replace('Z', '+00:00'))
+                                except Exception as e:
+                                    st.error(f"Error parsing timestamp {raw_timestamp}: {str(e)}")
+                                    continue
+                            else:
+                                st.error(f"No block data found for height {tx['height']}")
+                                continue
                             
                             # Get raw transaction data
                             raw_tx = tx.get("tx")
@@ -333,8 +360,18 @@ async def fetch_transactions(progress_bar, start_height=None):
                                                 for vote in msg_data["place_vote"]["weight_allocation"]
                                             ]
                                             
-                                            transactions.append(tx_data)
-                                            # st.success(f"Successfully processed transaction: {tx['hash']}")
+                                            current_batch.append(tx_data)
+                                            total_processed += 1
+
+                                            # Process batch if we've reached batch_size
+                                            if len(current_batch) >= batch_size:
+                                                try:
+                                                    # Store the batch
+                                                    if current_batch:
+                                                        wallet_votes_collection.insert_many(current_batch)
+                                                except Exception as e:
+                                                    st.error(f"Error storing batch: {str(e)}")
+                                                current_batch = []  # Clear the batch
 
                             except Exception as e:
                                 st.error(f"Error parsing message for {tx['hash']}: {str(e)}")
@@ -344,8 +381,8 @@ async def fetch_transactions(progress_bar, start_height=None):
                             st.error(f"Error processing transaction {tx.get('hash')}: {str(e)}")
                             continue
 
-                    progress = min(1.0, page / total_pages)
-                    progress_bar.progress(progress, f"Processing page {page}/{total_pages}")
+                    progress = min(1.0, total_processed / total_count)
+                    progress_bar.progress(progress, f"Processing transactions: {total_processed}/{total_count}")
                     page += 1
                     
                     # Stop if we've hit previously processed blocks
@@ -364,29 +401,14 @@ async def fetch_transactions(progress_bar, start_height=None):
     except Exception as e:
         st.error(f"Error in WebSocket connection: {str(e)}")
     
-    return transactions
-
-def store_transactions(transactions):
-    """Store transactions in MongoDB"""
-    if not transactions:
-        return
-        
-    operations = []
-    for tx in transactions:
-        operations.append(
-            UpdateOne(
-                {"transaction_hash": tx["transaction_hash"]},  # Use transaction_hash as unique identifier
-                {"$set": tx},
-                upsert=True
-            )
-        )
-    
-    try:
-        result = wallet_votes_collection.bulk_write(operations)
-        # st.success(f"Successfully stored {len(transactions)} transactions")
-    except BulkWriteError as e:
-        st.error(f"Error storing transactions: {str(e)}")
-        raise
+    # Store any remaining transactions in the final batch
+    if current_batch:
+        try:
+            wallet_votes_collection.insert_many(current_batch)
+        except Exception as e:
+            st.error(f"Error storing final batch: {str(e)}")
+                
+    return total_processed  # Return the count of processed transactions instead of the transactions themselves
 
 def fetch_epochs():
     """Fetch epoch data from the contract"""
@@ -503,7 +525,7 @@ def get_wallet_essence(wallet_address: str) -> dict:
                         return {
                             "wallet_address": wallet_address,
                             "essence_value": data['data'][0].get('essence_value', '0'),
-                            "snapshot_time": datetime.utcnow()
+                            "snapshot_time": datetime.now(timezone.utc)
                         }
             except Exception as e:
                 continue  # Try next endpoint
@@ -516,18 +538,25 @@ def get_wallet_essence(wallet_address: str) -> dict:
 
 def get_wallet_essences(wallets: List[str], progress_bar) -> Dict[str, str]:
     """Get essence values for all wallets"""
-    # Check if we have a recent snapshot
+    # Check if we have recent snapshots
     latest_snapshot = wallet_essence_collection.find_one(
+        {},
         sort=[("snapshot_time", pymongo.DESCENDING)]
     )
     
-    if latest_snapshot and datetime.utcnow() - latest_snapshot['snapshot_time'] < timedelta(hours=ESSENCE_SNAPSHOT_VALIDITY_HOURS):
-        # Use existing snapshot
-        snapshots = list(wallet_essence_collection.find())
-        return {
-            snap['wallet_address']: snap['essence_value'] 
-            for snap in snapshots
-        }, latest_snapshot['snapshot_time']
+    if latest_snapshot:
+        # Convert MongoDB datetime to timezone-aware
+        snapshot_time = latest_snapshot['snapshot_time']
+        if snapshot_time.tzinfo is None:
+            snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
+            
+        if datetime.now(timezone.utc) - snapshot_time < timedelta(hours=ESSENCE_SNAPSHOT_VALIDITY_HOURS):
+            # Use existing snapshot
+            snapshots = list(wallet_essence_collection.find())
+            return {
+                snap['wallet_address']: snap['essence_value'] 
+                for snap in snapshots
+            }, snapshot_time
     
     # Need new snapshot
     progress_bar.progress(0, "Fetching wallet voting power...")
@@ -573,9 +602,9 @@ def create_dashboard():
         
         try:
             # Fetch and store transactions
-            transactions = asyncio.run(fetch_transactions(progress_bar))
-            if transactions:
-                store_transactions(transactions)
+            processed_transactions = asyncio.run(fetch_transactions(progress_bar))
+            if processed_transactions > 0:
+                st.success(f"Successfully synced {processed_transactions} transactions")
             
         except Exception as e:
             st.error(f"Error syncing transactions: {str(e)}")
@@ -597,7 +626,8 @@ def create_dashboard():
     # Sort epochs by epoch_id in descending order to get most recent first
     sorted_epochs = sorted(epochs, key=lambda x: x['epoch_id'], reverse=True)
     for epoch in sorted_epochs:
-        end_date = datetime.fromtimestamp(epoch['end_date'])
+        # Convert epoch end_date to timezone-aware datetime
+        end_date = datetime.fromtimestamp(epoch['end_date'], tz=timezone.utc)
         epoch_options.append(f"Epoch {epoch['epoch_id']} (ends {end_date.strftime('%Y-%m-%d')})")
     
     selected_epoch = st.selectbox("Select Epoch", epoch_options, index=0)
@@ -607,15 +637,16 @@ def create_dashboard():
     if epoch_data:
         # Show loading spinner while aggregating data
         with st.spinner('Preparing voting data...'):
-            end_timestamp = datetime.fromtimestamp(epoch_data['end_date'])
+            end_timestamp = datetime.fromtimestamp(epoch_data['end_date'], tz=timezone.utc)
+            start_timestamp = end_timestamp - timedelta(days=14)  # Each epoch is 14 days
             
             pipeline = [
                 {
                     "$match": {
-                        "$or": [
-                            {"block_timestamp": {"$lte": end_timestamp}},
-                            {"block_timestamp": None}
-                        ]
+                        "block_timestamp": {
+                            "$gte": start_timestamp,
+                            "$lte": end_timestamp
+                        }
                     }
                 },
                 {
@@ -626,7 +657,7 @@ def create_dashboard():
                 {
                     "$group": {
                         "_id": "$sender",
-                        "latest_vote": {"$last": "$$ROOT"}
+                        "latest_vote": {"$last": "$$ROOT"}  # Gets the most recent vote per wallet within the epoch window
                     }
                 }
             ]

@@ -7,6 +7,7 @@ import base64
 import asyncio
 import nest_asyncio
 import pandas as pd
+import plotly.express as px
 
 # Enable nested event loops
 nest_asyncio.apply()
@@ -164,8 +165,8 @@ if voting_data and pool_data:
         end_date = datetime.fromtimestamp(result['end_date']).strftime('%Y-%m-%d')
         epochs.append(f"Epoch {epoch_id} (ends {end_date})")
 
-    # Create selectbox for epochs
-    selected_epoch = st.selectbox("Select Epoch", epochs, index=0)
+    # Create selectbox for epochs, defaulting to the most recent epoch
+    selected_epoch = st.selectbox("Select Epoch", epochs, index=len(epochs)-1)
     
     # Get selected epoch data
     epoch_id = int(selected_epoch.split()[1])
@@ -179,16 +180,49 @@ if voting_data and pool_data:
         # Create table of pool votes
         st.subheader("Pool Vote Distribution")
         
+        # Get previous epoch data if available
+        prev_epoch_data = None
+        if epoch_id > 1:
+            prev_epoch_data = next(
+                (result for result in voting_data['data']['vote_results'] if result['epoch_id'] == epoch_id - 1),
+                None
+            )
+        
+        # Create mapping of previous epoch weights if available
+        prev_weights = {}
+        if prev_epoch_data:
+            for weight in prev_epoch_data['elector_weights']:
+                prev_weights[weight['lp_token']] = float(weight['weight']) * 100
+        
         # Prepare data for the table
         table_data = []
         for weight in epoch_data['elector_weights']:
             pool_name = pool_names.get(weight['lp_token'], weight['lp_token'])
             vote_weight = float(weight['weight']) * 100
-            table_data.append({
+            
+            # Calculate delta if previous epoch data exists
+            delta = None
+            if prev_weights:
+                prev_weight = prev_weights.get(weight['lp_token'], 0)
+                delta = vote_weight - prev_weight
+            
+            row_data = {
                 "Pool": pool_name,
-                "Vote Weight (%)": f"{vote_weight:.2f}%",
+                "Vote Weight (%)": f"{vote_weight:.1f}%",
                 "Visual Distribution": vote_weight  # Raw percentage for sorting
-            })
+            }
+            
+            # Add delta column if we have previous data and change is >= 1%
+            if delta is not None and abs(delta) >= 1.0:
+                # Create delta display with color and arrow
+                arrow = "▲" if delta > 0 else "▼" if delta < 0 else "−"
+                color = "#00cc00" if delta > 0 else "#ff4b4b" if delta < 0 else "#666666"
+                delta_display = f'<span style="color: {color}">{arrow} {abs(delta):.1f}%</span>'
+                row_data["Δ from Previous"] = delta_display
+            elif delta is not None:
+                row_data["Δ from Previous"] = ""  # Empty string for changes < 1%
+            
+            table_data.append(row_data)
         
         # Convert to DataFrame and sort
         df = pd.DataFrame(table_data)
@@ -236,5 +270,80 @@ if voting_data and pool_data:
                 }
             </style>
         """, unsafe_allow_html=True)
+
+        # Create historical voting trend chart
+        st.subheader("Historical Voting Trends")
+        
+        # Process all epochs data
+        trend_data = []
+        for result in voting_data['data']['vote_results']:
+            epoch_id = result['epoch_id']
+            end_date = datetime.fromtimestamp(result['end_date']).strftime('%Y-%m-%d')
+            
+            for weight in result['elector_weights']:
+                pool_name = pool_names.get(weight['lp_token'], weight['lp_token'])
+                vote_weight = float(weight['weight']) * 100
+                trend_data.append({
+                    'Epoch': f"Epoch {epoch_id}",
+                    'End Date': end_date,
+                    'Pool': pool_name,
+                    'Vote Weight (%)': vote_weight
+                })
+        
+        # Convert to DataFrame
+        trend_df = pd.DataFrame(trend_data)
+        
+        # Calculate average vote weight per pool across all epochs
+        avg_votes = trend_df.groupby('Pool')['Vote Weight (%)'].mean().sort_values(ascending=False)
+        
+        # Filter pools with less than 1% average votes and create a new DataFrame
+        significant_pools = avg_votes[avg_votes >= 1.0].index
+        trend_df_filtered = trend_df[trend_df['Pool'].isin(significant_pools)].copy()  # Create explicit copy
+        
+        # Sort pools by their average vote weight for consistent colors
+        pool_order = avg_votes[avg_votes >= 1.0].index.tolist()
+        trend_df_filtered.loc[:, 'Pool'] = pd.Categorical(trend_df_filtered['Pool'], categories=pool_order, ordered=True)
+        
+        # Create line chart
+        fig = px.line(
+            trend_df_filtered,
+            x='Epoch',
+            y='Vote Weight (%)',
+            color='Pool',
+            markers=True,
+            title='Voting Trends Across Epochs (Pools with >1% Average Votes)',
+            category_orders={'Pool': pool_order}  # This ensures consistent color assignment
+        )
+        
+        # Update layout
+        fig.update_layout(
+            xaxis_title="Epoch",
+            yaxis_title="Vote Weight (%)",
+            legend_title="Pool",
+            hovermode='x unified',
+            legend=dict(
+                traceorder='normal',  # This ensures the legend follows our category order
+                itemsizing='constant'
+            )
+        )
+        
+        # Sort hover template to show pools in descending order of vote weight
+        fig.update_traces(
+            hovertemplate='%{y:.1f}%'  # Simplified hover text
+        )
+        
+        # Custom hover data sorting
+        fig.update_layout(
+            hoverlabel=dict(
+                font_size=12,
+                font_family="Arial"
+            ),
+            # This function will sort the hover data
+            hovermode='x unified',
+            hoverdistance=100
+        )
+        
+        # Display the chart
+        st.plotly_chart(fig, use_container_width=True)
 else:
     st.error("Failed to fetch data. Please check your internet connection and try again.")
