@@ -334,7 +334,7 @@ async def fetch_transactions(progress_bar, start_height=None):
                                             ]
                                             
                                             transactions.append(tx_data)
-                                            st.success(f"Successfully processed transaction: {tx['hash']}")
+                                            # st.success(f"Successfully processed transaction: {tx['hash']}")
 
                             except Exception as e:
                                 st.error(f"Error parsing message for {tx['hash']}: {str(e)}")
@@ -383,7 +383,7 @@ def store_transactions(transactions):
     
     try:
         result = wallet_votes_collection.bulk_write(operations)
-        st.success(f"Successfully stored {len(transactions)} transactions")
+        # st.success(f"Successfully stored {len(transactions)} transactions")
     except BulkWriteError as e:
         st.error(f"Error storing transactions: {str(e)}")
         raise
@@ -594,7 +594,9 @@ def create_dashboard():
     
     # Create epoch selector
     epoch_options = []
-    for epoch in epochs:
+    # Sort epochs by epoch_id in descending order to get most recent first
+    sorted_epochs = sorted(epochs, key=lambda x: x['epoch_id'], reverse=True)
+    for epoch in sorted_epochs:
         end_date = datetime.fromtimestamp(epoch['end_date'])
         epoch_options.append(f"Epoch {epoch['epoch_id']} (ends {end_date.strftime('%Y-%m-%d')})")
     
