@@ -697,7 +697,7 @@ def create_dashboard():
             
             # Display each wallet group
             for wallet, data in sorted_wallets:
-                st.markdown(f"#### Wallet: `{wallet}`")
+                st.markdown(f"#### [`{wallet}`](https://equinox-positions.streamlit.app/?wallet={wallet})")
                 st.markdown(f"*Cosmic Essence: {data['essence']:,}*")  # Already in millions and formatted with commas
                 
                 # Create DataFrame for this wallet's votes
