@@ -14,6 +14,7 @@ import time
 from pymongo.errors import BulkWriteError
 from pymongo import UpdateOne
 from pymongo import MongoClient
+import sys
 
 # Enable nested event loops
 nest_asyncio.apply()
@@ -582,6 +583,17 @@ def get_wallet_essences(wallets: List[str], progress_bar) -> Dict[str, str]:
     
     return {}, None
 
+def query_total_cosmic_essence():
+    """Query total cosmic essence in existence"""
+    url = "https://rest.cosmos.directory/neutron/cosmwasm/wasm/v1/contract/neutron19q93n64nyet24ynvw04qjqmejffkmyxakdvl08sf3n3yeyr92lrs2makhx/smart/eyJxdWVyeV90b3RhbF9lc3NlbmNlIjp7fX0="
+    try:
+        response = requests.get(url)
+        data = response.json()
+        return int(int(data['data']['essence']) // 1_000_000)
+    except Exception as e:
+        st.error(f"Error querying total cosmic essence: {str(e)}")
+        return None
+
 def create_dashboard():
     st.title("Equinox Wallet Voting Dashboard")
     
@@ -672,6 +684,26 @@ def create_dashboard():
             
             if snapshot_time:
                 st.info(f"Voting weight as per {snapshot_time.strftime('%Y-%m-%d')}")
+            
+            # Calculate total voting user cosmic essence
+            total_voting_essence = sum(int(int(essence_values.get(sender, '0')) / 1_000_000) for sender in wallet_addresses)
+            
+            # Get total cosmic essence
+            total_essence = query_total_cosmic_essence()
+            if total_essence is None:
+                total_essence = 0
+            
+            # Calculate participation percentage
+            participation_pct = (total_voting_essence / total_essence * 100) if total_essence > 0 else 0
+            
+            # Display metrics in columns
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Voting User Cosmic Essence", f"{total_voting_essence:,}")
+            with col2:
+                st.metric("Total Cosmic Essence", f"{total_essence:,}")
+            with col3:
+                st.metric("Participation Percentage", f"{participation_pct:.2f}%")
             
             st.subheader(f"Wallet Voting Distribution (Total Wallets: {len(wallet_votes)})")
             
